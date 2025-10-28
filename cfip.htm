@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auto HTTP Ping CF CIDR Tool</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .log-box {
+            width: 100%;
+            height: 200px;
+            font-family: monospace;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background-color: #f9f9f9;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .result-box {
+            width: 100%;
+            height: 150px;
+            font-family: monospace;
+            padding: 10px;
+            border: 1px solid #28a745;
+            border-radius: 4px;
+            background-color: #f8fff9;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            font-weight: bold;
+        }
+        .status {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 8px 16px;
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Auto HTTP Ping CF CIDR Tool</h1>
+    <div class="status" id="status">页面加载完成，2秒后自动开始扫描...</div>
+
+    <div class="container">
+        <div>
+            <strong>运行日志：</strong>
+            <div id="log" class="log-box"></div>
+        </div>
+        <div>
+            <strong>最终结果（响应时间 &lt; 400ms）：</strong>
+            <div id="result" class="result-box"></div>
+        </div>
+    </div>
+
+    <div style="margin-top: 15px;">
+        <button id="stop-btn" disabled>停止扫描</button>
+        <button id="restart-btn">重新开始</button>
+    </div>
+
+    <script>
+        const logDiv = document.getElementById('log');
+        const resultDiv = document.getElementById('result');
+        const statusDiv = document.getElementById('status');
+        const stopBtn = document.getElementById('stop-btn');
+        const restartBtn = document.getElementById('restart-btn');
+
+        let isPinging = false;
+        let pingQueue = [];
+        let pingdata = [];
+        let currentIndex = 0;
+        let autoStartTimeout;
+
+        stopBtn.addEventListener('click', stopPing);
+        restartBtn.addEventListener('click', restart);
+
+        function log(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            logDiv.innerHTML += `[${timestamp}] ${message}\n`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function updateResult() {
+            resultDiv.innerHTML = '';
+            if (pingdata.length === 0) {
+                resultDiv.innerHTML = '暂无符合条件的IP（响应时间 < 400ms）\n';
+                return;
+            }
+            pingdata.sort((a, b) => a.time - b.time);
+            pingdata.forEach(res => {
+                resultDiv.innerHTML += `${res.ip}:${res.port}#${res.colo}${res.time}ms\n`;
+            });
+            resultDiv.scrollTop = resultDiv.scrollHeight;
+        }
+
+        function ipToLong(ip) {
+            const parts = ip.split('.').map(Number);
+            return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+        }
+
+        function longToIp(long) {
+            return [(long >>> 24) & 255, (long >>> 16) & 255, (long >>> 8) & 255, long & 255].join('.');
+        }
+
+        function generateRandomIPs(cidr, count = 5) {
+            const [ip, prefixStr] = cidr.split('/');
+            const prefix = parseInt(prefixStr);
+            if (isNaN(prefix) || prefix < 0 || prefix > 32 || ip.split('.').length !== 4) {
+                return [];
+            }
+            const base = ipToLong(ip);
+            const numAddresses = 1 << (32 - prefix);
+            const start = base + 1;
+            const end = base + numAddresses - 2;
+            if (start > end) return [];
+            const ips = new Set();
+            while (ips.size < count && ips.size < (end - start + 1)) {
+                const randomLong = Math.floor(Math.random() * (end - start + 1)) + start;
+                ips.add(longToIp(randomLong));
+            }
+            return Array.from(ips);
+        }
+
+        async function ping(url) {
+            const startTime = performance.now();
+            try {
+                const response = await fetch(url, {
+                    method: 'HEAD',
+                    mode: 'no-cors',
+                    cache: 'no-store'
+                });
+                const endTime = performance.now();
+                const time = (endTime - startTime).toFixed(2);
+                return { success: true, time: parseFloat(time) };
+            } catch (error) {
+                const endTime = performance.now();
+                const time = (endTime - startTime).toFixed(2);
+                return { success: false, time: parseFloat(time), error: error.message };
+            }
+        }
+
+        async function getColo(ip, port) {
+            const traceUrl = `http://${ip}:${port}/cdn-cgi/trace`;
+            try {
+                const response = await fetch(traceUrl, {
+                    method: 'GET',
+                    mode: 'cors',
+                    cache: 'no-store',
+                    signal: AbortSignal.timeout(5000) // 5秒超时
+                });
+                if (!response.ok) throw new Error('Response not OK');
+                const text = await response.text();
+                const lines = text.split('\n');
+                const coloLine = lines.find(line => line.startsWith('colo='));
+                return coloLine ? coloLine.slice(5).trim() : 'Unknown';
+            } catch (error) {
+                return 'Error';
+            }
+        }
+
+        async function processNext() {
+            if (currentIndex >= pingQueue.length || !isPinging) {
+                await processColo();
+                finalizeResults();
+                return;
+            }
+
+            const { ip, port } = pingQueue[currentIndex];
+            const url = `http://${ip}:${port}/`;
+            log(`正在测试 ${ip}:${port}`);
+
+            const result = await ping(url);
+
+            if (result.success && result.time < 400) {
+                pingdata.push({ ip, port, time: result.time });
+                log(`  成功: ${result.time}ms (已加入待测列表)`);
+                // 实时更新结果
+                updateResult();
+            } else {
+                log(`  跳过: ${result.time}ms ${result.error ? `(错误: ${result.error})` : ''}`);
+            }
+
+            currentIndex++;
+            setTimeout(processNext, 80); // 每80ms测试一个，避免阻塞
+        }
+
+        async function processColo() {
+            log(`\n开始获取 ${pingdata.length} 个IP的 colo 区域信息...`);
+            for (let i = 0; i < pingdata.length; i++) {
+                if (!isPinging) return;
+                const entry = pingdata[i];
+                log(`  正在获取 ${entry.ip}:${entry.port} 的 colo...`);
+                const colo = await getColo(entry.ip, entry.port);
+                if (colo !== 'Error' && colo !== 'Unknown') {
+                    entry.colo = colo;
+                    log(`    成功: colo=${colo}`);
+                } else {
+                    pingdata.splice(i, 1);
+                    i--;
+                    log(`    失败: 获取 colo 失败，已移除`);
+                }
+                updateResult(); // 实时更新
+            }
+        }
+
+        function finalizeResults() {
+            log(`\n扫描完成！共发现 ${pingdata.length} 个低延迟IP。`);
+            updateResult();
+            statusDiv.textContent = '扫描已完成。';
+            stopPing();
+        }
+
+        async function startProcess() {
+            if (isPinging) return;
+            clearLogs();
+            statusDiv.textContent = '正在加载 CIDR 列表...';
+
+            const cidrUrl = 'https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt';
+            log(`正在从 ${cidrUrl} 加载 CIDR 列表...`);
+
+            try {
+                const response = await fetch(cidrUrl);
+                if (!response.ok) throw new Error('无法加载 CIDR 文件');
+                const text = await response.text();
+                const cidrs = text.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+                log(`成功加载 ${cidrs.length} 条 CIDR 规则。`);
+
+                let allIps = [];
+                cidrs.forEach(cidr => {
+                    try {
+                        const ips = generateRandomIPs(cidr);
+                        if (ips.length > 0) {
+                            log(`从 ${cidr} 生成 ${ips.length} 个随机IP`);
+                            allIps = allIps.concat(ips);
+                        }
+                    } catch (error) {
+                        log(`生成 ${cidr} 的IP失败: ${error.message}`);
+                    }
+                });
+
+                log(`共生成 ${allIps.length} 个IP地址，开始逐一测试（端口 80）...`);
+
+                pingQueue = allIps.map(ip => ({ ip, port: 80 }));
+                pingdata = [];
+                currentIndex = 0;
+
+                isPinging = true;
+                stopBtn.disabled = false;
+                restartBtn.disabled = true;
+                statusDiv.textContent = `正在测试 ${allIps.length} 个IP...`;
+
+                processNext();
+            } catch (error) {
+                log(`错误: ${error.message}`);
+                statusDiv.textContent = '加载失败，请刷新重试。';
+                stopPing();
+            }
+        }
+
+        function stopPing() {
+            isPinging = false;
+            stopBtn.disabled = true;
+            restartBtn.disabled = false;
+            statusDiv.textContent = '扫描已停止。';
+        }
+
+        function clearLogs() {
+            logDiv.innerHTML = '';
+            resultDiv.innerHTML = '';
+            pingdata = [];
+        }
+
+        function restart() {
+            stopPing();
+            clearLogs();
+            statusDiv.textContent = '页面加载完成，2秒后自动开始扫描...';
+            autoStartTimeout = setTimeout(startProcess, 2000);
+        }
+
+        // 页面加载完成后 2 秒自动开始
+        window.addEventListener('load', () => {
+            statusDiv.textContent = '页面加载完成，2秒后自动开始扫描...';
+            autoStartTimeout = setTimeout(startProcess, 2000);
+        });
+    </script>
+</body>
+</html>
